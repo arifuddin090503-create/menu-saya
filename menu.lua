@@ -62,5 +62,34 @@ local function buatToggle(nama, urutan, saatBerubah)
 	end)
 end
 
-buatToggle("Fitur 1", 1, function(on) print("Fitur 1:", on) end)
+-- Fitur 1: jalan bolak-balik
+local jalanAktif = false
+
+buatToggle("Jalan Bolak-balik", 1, function(on)
+	jalanAktif = on
+	if not on then return end
+
+	task.spawn(function()
+		local arah = 1
+		while jalanAktif do
+			local char = player.Character
+			local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+			if humanoid then
+				local mulai = tick()
+				while jalanAktif and tick() - mulai < 2 do
+					humanoid:Move(Vector3.new(arah, 0, 0), false)
+					task.wait()
+				end
+				arah = -arah
+			else
+				task.wait(0.5)
+			end
+		end
+		local char = player.Character
+		local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+		if humanoid then humanoid:Move(Vector3.zero) end
+	end)
+end)
+
+-- Fitur 2 (masih kosong)
 buatToggle("Fitur 2", 2, function(on) print("Fitur 2:", on) end)
