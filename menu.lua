@@ -4,6 +4,7 @@ if _G.kunci_saya ~= "KEY-BELAJAR-123" then
 end
 
 local player = game.Players.LocalPlayer
+local RunService = game:GetService("RunService")
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "MenuSaya"
@@ -38,6 +39,7 @@ judul.LayoutOrder = 0
 judul.Parent = frame
 judul.MouseButton1Click:Connect(function() gui:Destroy() end)
 
+-- mengembalikan fungsi set(nilai) untuk menghidupkan/mematikan dari kode
 local function buatToggle(nama, urutan, saatBerubah)
 	local aktif = false
 	local btn = Instance.new("TextButton")
@@ -55,45 +57,75 @@ local function buatToggle(nama, urutan, saatBerubah)
 	end
 	refresh()
 
-	btn.MouseButton1Click:Connect(function()
-		aktif = not aktif
+	local function set(nilai)
+		if aktif == nilai then return end
+		aktif = nilai
 		refresh()
 		saatBerubah(aktif)
+	end
+
+	btn.MouseButton1Click:Connect(function()
+		set(not aktif)
 	end)
+
+	return set
 end
 
--- Fitur 1: jalan bolak-balik
-local RunService = game:GetService("RunService")
-local jalanAktif = false
-local koneksi
+-- helper gerak
+local function ambilKarakter()
+	local char = player.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	return hum, root
+end
 
-local function hentikanJalan()
-	if koneksi then
-		koneksi:Disconnect()
-		koneksi = nil
-	end
-	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+local function berhenti(namaBind)
+	pcall(function() RunService:UnbindFromRenderStep(namaBind) end)
+	local hum = ambilKarakter()
 	if hum then hum:Move(Vector3.zero) end
 end
 
-buatToggle("Jalan Bolak-balik", 1, function(on)
-	jalanAktif = on
-	hentikanJalan()
+local PRIORITAS = Enum.RenderPriority.Input.Value + 1
+local BIND_BOLAK = "JalanBolakBalik"
+local BIND_MAJU = "JalanMaju"
+
+local setBolak, setMaju
+
+-- Fitur 1: jalan bolak-balik
+setBolak = buatToggle("Jalan Bolak-balik", 1, function(on)
+	if on then setMaju(false) end
+	berhenti(BIND_BOLAK)
 	if not on then return end
 
-	local arah = -1 -- -1 = maju, 1 = mundur
+	local arah = 1 -- 1 = maju, -1 = mundur
 	local gantiAt = os.clock() + 2
 
-	koneksi = RunService.RenderStepped:Connect(function()
-		local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-		if not hum then return end
+	RunService:BindToRenderStep(BIND_BOLAK, PRIORITAS, function()
+		local hum, root = ambilKarakter()
+		if not (hum and root) then return end
 		if os.clock() >= gantiAt then
 			arah = -arah
 			gantiAt = os.clock() + 2
 		end
-		hum:Move(Vector3.new(0, 0, arah), true)
+		hum:Move(root.CFrame.LookVector * arah, false)
 	end)
 end)
 
--- matikan jalan juga saat menu ditutup
-gui.Destroying:Connect(hentikanJalan)
+-- Fitur 2: jalan maju terus
+setMaju = buatToggle("Jalan Maju", 2, function(on)
+	if on then setBolak(false) end
+	berhenti(BIND_MAJU)
+	if not on then return end
+
+	RunService:BindToRenderStep(BIND_MAJU, PRIORITAS, function()
+		local hum, root = ambilKarakter()
+		if not (hum and root) then return end
+		hum:Move(root.CFrame.LookVector, false)
+	end)
+end)
+
+-- matikan semuanya saat menu ditutup
+gui.Destroying:Connect(function()
+	berhenti(BIND_BOLAK)
+	berhenti(BIND_MAJU)
+end)
