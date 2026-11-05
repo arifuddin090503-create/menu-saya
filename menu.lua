@@ -63,35 +63,40 @@ local function buatToggle(nama, urutan, saatBerubah)
 end
 
 -- Fitur 1: jalan bolak-balik
+local RunService = game:GetService("RunService")
 local jalanAktif = false
+local koneksi
+
+local function hentikanJalan()
+	if koneksi then
+		koneksi:Disconnect()
+		koneksi = nil
+	end
+	local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+	if hum then hum:Move(Vector3.zero) end
+end
 
 buatToggle("Jalan Bolak-balik", 1, function(on)
 	jalanAktif = on
+	hentikanJalan()
 	if not on then return end
 
-	local RunService = game:GetService("RunService")
-local koneksi
+	local arah = -1 -- -1 = maju, 1 = mundur
+	local gantiAt = os.clock() + 2
 
-if not on then
-    if koneksi then koneksi:Disconnect() koneksi = nil end
-    return
-end
+	koneksi = RunService.RenderStepped:Connect(function()
+		local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if not hum then return end
+		if os.clock() >= gantiAt then
+			arah = -arah
+			gantiAt = os.clock() + 2
+		end
+		hum:Move(Vector3.new(0, 0, arah), true)
+	end)
+end)
 
-local arah = -1 -- -1 = maju, 1 = mundur
-local gantiAt = os.clock() + 2
-
-koneksi = RunService.RenderStepped:Connect(function()
-    if not jalanAktif then
-        koneksi:Disconnect()
-        koneksi = nil
-        local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-        if hum then hum:Move(Vector3.zero) end
-        return
-    end
-    local hum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
-    if not hum then return end
-    if os.clock() >= gantiAt then
-        arah = -arah
+-- matikan jalan juga saat menu ditutup
+gui.Destroying:Connect(hentikanJalan)
         gantiAt = os.clock() + 2
     end
     hum:Move(Vector3.new(0, 0, arah), true)
