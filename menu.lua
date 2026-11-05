@@ -1,785 +1,1247 @@
 --[[
-    GrowBlox Suite v2.2 (FIXED) - In-Game UI
-    Runtime: Roblox Lua (Synapse X / Fluxus / Delta / Hydrogen)
+	Growblox — WindUI script
+	celineasher/growblox
+ 
+	Features: auto collect, auto mine (hold-to-break, name filter, single/multi),
+	fly, noclip, speed.
+ 
+	Load:
+		loadstring(game:HttpGet("https://raw.githubusercontent.com/celineasher/growblox/main/growblox.lua"))()
+ 
+	Window toggle: RightShift
+ 
+	------------------------------------------------------------------
+	AUTO MINE — READ THIS
+	------------------------------------------------------------------
+	The block-breaking internals could not be verified against a live
+	client. Everything that depends on unknown game internals is
+	isolated in worldTiles() / tileId() / blockName() / detectMinePath()
+	/ breakTile() and marked -- UNVERIFIED.
+ 
+	If Auto Mine does nothing or errors on first run, press the
+	"Mine Diagnostics" button and read the console. That output tells
+	us which guessed field name is wrong, and the fix is localised to
+	the TILE_FIELDS / TILE_ID_FIELDS tables at the top of the mine
+	section.
+	------------------------------------------------------------------
+ 
+	FIX LOG (auto collect):
+	- Forward declarations: FlyToggle / AutoToggle / MineToggle / notify /
+	  setAutoMine / getPos are now declared at the top, so functions defined
+	  earlier no longer see nil globals.
+	- pickDrop uses pairs() instead of ipairs(), so it also works when
+	  dropList() returns a table keyed by uid (Status showed "Drops: N" but
+	  auto collect found nothing).
+	- Drops with non-number x/y are skipped instead of throwing an error that
+	  silently turned Auto Collect off.
+	- Un-armed drops no longer cause an endless step-back loop; after a few
+	  attempts the drop is skipped.
+	- If the collect loop errors, the reason is printed and shown in a notify.
+	- Target = the dropped item nearest to the player (straight-line
+	  distance), re-checked every tick so a closer drop takes over.
 ]]
-
--- ══════════════════════════════════════════════════════════════
---  CONFIG
--- ══════════════════════════════════════════════════════════════
-local CFG = {
-    WorkSpeed = {
-        Enabled     = true,
-        Multiplier  = 3.0,
-        Base = {
-            WalkSpeed       = 16,
-            HoldDuration    = 0.35,
-            CooldownAfter   = 0.10,
-            CollectInterval = 0.15,
-            PunchInterval   = 0.30,
-            ScanInterval    = 3.00,
-            SweepDelay      = 0.08,
-        },
-    },
-    Scan    = { Enabled=true,  Radius=200, Interval=3.0,
-                ItemPatterns={"Fruit","Crop","Drop","Loot","Item","Gem","Seed"},
-                ItemTag="DroppedItem", PrintToOutput=true },
-    Break   = { Enabled=false, HoldDuration=0.35, CooldownAfter=0.10,
-                Radius=15, BlockTag="Block",
-                BlockPatterns={"Block","Tree","Rock","Dirt","Wood","Seed"},
-                BreakRemote="BreakBlock", NearestFirst=true },
-    Clear   = { Enabled=false, WorldSweep=true, SweepDelay=0.08 },
-    Collect = { Enabled=false, Radius=40, Interval=0.15 },
-    Punch   = { Enabled=false, Range=60, Interval=0.30,
-                Target="NPCs", Remote="PunchEvent" },
-    Path    = { Enabled=true,  WaypointSkip=3, RetryDelay=1.2,
-                StuckThreshold=2.5, UseRPS=true,
-                GridWidth=100, GridHeight=60 },
-    -- FIX: dijadikan table supaya bisa di-toggle lewat UI (.Enabled)
-    AntiAFK = { Enabled=true },
+ 
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local VIM = game:GetService("VirtualInputManager")
+local RS = game:GetService("ReplicatedStorage")
+ 
+if _G.GrowbloxLoaded and _G.GrowbloxLoaded.Destroy then
+	pcall(_G.GrowbloxLoaded.Destroy)
+end
+_G.GrowbloxLoaded = nil
+ 
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+local ItemDB = require(RS.Shared.ItemDB)
+ 
+local state = {
+	running = true,
+	autoCollect = false,
+	fly = false,
+	noclip = false,
+	speed = false,
+	speedMult = 1.8,
+	range = 80,
+ 
+	autoMine = false,
+	mineSingle = false,
+	mineFilter = "",
+	mineRadius = 40,
+	mineHold = 1.5,
+	mineDelay = 0.15,
+ 
+	speedApplied = false,
 }
-
--- ══════════════════════════════════════════════════════════════
---  SERVICES
--- ══════════════════════════════════════════════════════════════
-local Players            = game:GetService("Players")
-local PathfindingService = game:GetService("PathfindingService")
-local CollectionService  = game:GetService("CollectionService")
-local UserInputService   = game:GetService("UserInputService")
-local ReplicatedStorage  = game:GetService("ReplicatedStorage")
-local TweenService       = game:GetService("TweenService")
-local RunService         = game:GetService("RunService")
-
-local lp = Players.LocalPlayer
-print("[olliE] script started")
-pcall(function()
-    game:GetService("StarterGui"):SetCore("SendNotification",{
-        Title="olliE", Text="Script started", Duration=4,
-    })
-end)
-
--- FIX: jangan menunggu selamanya kalau karakter/HumanoidRootPart tidak ada
-local char = lp.Character
-do
-    local t0 = tick()
-    while not char and tick()-t0 < 5 do task.wait(0.2); char = lp.Character end
+ 
+local world
+local renderFn
+local solidAt
+local solidOriginal
+local posIndex
+local posLastCalibration = 0
+local calibrating = false
+ 
+-- FIX: forward declarations (these were used before their `local` line,
+-- so they resolved to nil globals).
+local AutoToggle, MineToggle, FlyToggle, NoclipToggle, SpeedToggle, StatusParagraph
+local notify, setAutoMine, getPos
+ 
+-- ==================================================================
+-- WORLD DISCOVERY (verified — same technique as the original script)
+-- ==================================================================
+ 
+local function getWorld()
+	if world then
+		local ok = pcall(function()
+			return world.name
+		end)
+		if ok then
+			return world
+		end
+	end
+	world = nil
+	for _, obj in pairs(getgc(true)) do
+		if type(obj) == "table" and rawget(obj, "dropList") and rawget(obj, "fg") and rawget(obj, "goTo") then
+			world = obj
+			return world
+		end
+	end
 end
-local root = char and char:WaitForChild("HumanoidRootPart", 5)
-local hum  = char and (char:FindFirstChildOfClass("Humanoid") or char:WaitForChild("Humanoid", 5))
-if not root then warn("[olliE] HumanoidRootPart tidak ditemukan (karakter custom?)") end
-if not hum  then warn("[olliE] Humanoid tidak ditemukan") end
-
--- ══════════════════════════════════════════════════════════════
---  WORKSPEED
--- ══════════════════════════════════════════════════════════════
-local WS = {}
-WS.E = {
-    WalkSpeed=16, HoldDuration=0.35, CooldownAfter=0.10,
-    CollectInterval=0.15, PunchInterval=0.30,
-    ScanInterval=3.00, SweepDelay=0.08,
+ 
+local function getRender()
+	if renderFn then
+		return renderFn
+	end
+	local w = getWorld()
+	if not w then
+		return nil
+	end
+	local best, bestSize = nil, 0
+	for _, obj in pairs(getgc(true)) do
+		if type(obj) == "function" then
+			local ok, ups = pcall(getupvalues, obj)
+			if ok and #ups > bestSize then
+				local has = false
+				for _, u in pairs(ups) do
+					if u == w then
+						has = true
+						break
+					end
+				end
+				if has then
+					best, bestSize = obj, #ups
+				end
+			end
+		end
+	end
+	if best then
+		renderFn = best
+	end
+	return renderFn
+end
+ 
+local function getSolidAt()
+	if solidAt then
+		return solidAt
+	end
+	local w = getWorld()
+	if not w then
+		return nil
+	end
+	for _, f in pairs(getgc(true)) do
+		if type(f) == "function" then
+			local ok, ups = pcall(getupvalues, f)
+			if ok and #ups == 2 then
+				local hasWorld, hasItemDB = false, false
+				for _, u in pairs(ups) do
+					if u == w then
+						hasWorld = true
+					end
+					if u == ItemDB then
+						hasItemDB = true
+					end
+				end
+				if hasWorld and hasItemDB then
+					local ok2, negW = pcall(f, -1, 0)
+					local ok3, negH = pcall(f, 0, -1)
+					local ok4, bigW = pcall(f, w.w, 0)
+					if ok2 and ok3 and ok4 and negW == true and bigW == true and negH == false then
+						solidAt = f
+						return f
+					end
+				end
+			end
+		end
+	end
+end
+ 
+local function getCandidates()
+	local r = getRender()
+	local w = getWorld()
+	if not (r and w) then
+		return {}
+	end
+	local ok, ups = pcall(getupvalues, r)
+	if not ok then
+		return {}
+	end
+	local list = {}
+	for i, v in pairs(ups) do
+		local ny = ups[i + 1]
+		if type(v) == "number" and type(ny) == "number" then
+			if v >= 0.3 and v <= w.w - 0.3 and ny >= 0.95 and ny <= w.h then
+				list[#list + 1] = { i = i, x = v, y = ny }
+			end
+		end
+	end
+	table.sort(list, function(a, b)
+		return a.i < b.i
+	end)
+	return list
+end
+ 
+local function readPos()
+	local r = getRender()
+	if not (r and posIndex) then
+		return nil
+	end
+	local ok, ups = pcall(getupvalues, r)
+	if not ok then
+		return nil
+	end
+	local x, y = ups[posIndex], ups[posIndex + 1]
+	if type(x) ~= "number" or type(y) ~= "number" then
+		return nil
+	end
+	return x, y
+end
+ 
+-- ==================================================================
+-- AUTO MINE
+-- ==================================================================
+ 
+-- UNVERIFIED: candidate field names for the tile container on world.
+local TILE_FIELDS = { "tiles", "blocks", "grid", "map", "tileData", "blockData" }
+-- UNVERIFIED: candidate field names for a tile's block id.
+local TILE_ID_FIELDS = { "id", "item", "block", "type", "itemId", "blockId" }
+ 
+local function worldTiles()
+	local w = getWorld()
+	if not w then
+		return nil, "no world"
+	end
+	for _, field in ipairs(TILE_FIELDS) do
+		local ok, val = pcall(function()
+			return w[field]
+		end)
+		if ok and type(val) == "table" then
+			return val, "world." .. field
+		end
+	end
+	return nil, "no tile field found"
+end
+ 
+local function tileId(tile)
+	if type(tile) == "number" then
+		return tile
+	end
+	if type(tile) ~= "table" then
+		return nil
+	end
+	for _, field in ipairs(TILE_ID_FIELDS) do
+		local v = tile[field]
+		if type(v) == "number" then
+			return v
+		end
+	end
+	return nil
+end
+ 
+local function blockName(id)
+	if not id then
+		return nil
+	end
+	local ok, entry = pcall(function()
+		return ItemDB[id]
+	end)
+	if ok and type(entry) == "table" then
+		return entry.name or entry.Name or entry.displayName or entry.title
+	end
+	if ok and type(entry) == "string" then
+		return entry
+	end
+	return nil
+end
+ 
+local function tileMatches(tile)
+	if state.mineFilter == "" then
+		return true
+	end
+	local id = tileId(tile)
+	local name = blockName(id)
+	if not name then
+		return false
+	end
+	return string.find(string.lower(name), string.lower(state.mineFilter), 1, true) ~= nil
+end
+ 
+local function readTileDurability(tile)
+	if type(tile) ~= "table" then
+		return nil
+	end
+	for _, field in ipairs({ "durability", "health", "hp", "progress", "hits" }) do
+		local v = tile[field]
+		if type(v) == "number" then
+			return v
+		end
+	end
+	return nil
+end
+ 
+local mineFn
+local function detectMinePath()
+	if mineFn then
+		return mineFn
+	end
+	local w = getWorld()
+	if not w then
+		return nil, "no world"
+	end
+	for _, f in pairs(getgc(true)) do
+		if type(f) == "function" then
+			local ok, ups = pcall(getupvalues, f)
+			if ok and #ups >= 2 and #ups <= 6 then
+				local hasWorld, hasItemDB = false, false
+				for _, u in pairs(ups) do
+					if u == w then
+						hasWorld = true
+					end
+					if u == ItemDB then
+						hasItemDB = true
+					end
+				end
+				if hasWorld and hasItemDB and f ~= solidAt then
+					mineFn = f
+					return f
+				end
+			end
+		end
+	end
+	return nil, "no mine function found"
+end
+ 
+local holding = false
+local function setHold(on)
+	if holding == on then
+		return
+	end
+	holding = on
+	pcall(function()
+		VIM:SendMouseButtonEvent(0, 0, 0, on, game, 0)
+	end)
+end
+ 
+local function breakTile(tile)
+	local fn = detectMinePath()
+	local id = tileId(tile)
+ 
+	if fn and id then
+		local startDur = readTileDurability(tile)
+		local ok = pcall(fn, id)
+		if ok then
+			if startDur then
+				local t0 = os.clock()
+				while os.clock() - t0 < state.mineHold do
+					task.wait(0.05)
+					local nowDur = readTileDurability(tile)
+					if nowDur and nowDur < startDur then
+						return true
+					end
+					if nowDur == nil then
+						break
+					end
+				end
+			end
+			return true
+		end
+	end
+ 
+	setHold(true)
+	local t0 = os.clock()
+	local startDur = readTileDurability(tile)
+	while os.clock() - t0 < state.mineHold do
+		task.wait(0.05)
+		if startDur then
+			local nowDur = readTileDurability(tile)
+			if nowDur and nowDur < startDur then
+				break
+			end
+		end
+	end
+	setHold(false)
+	return true
+end
+ 
+local function matchingTiles(px, py)
+	local container = worldTiles()
+	if not container then
+		return {}
+	end
+	local out = {}
+	for key, tile in pairs(container) do
+		if tileMatches(tile) then
+			local tx, ty
+			if type(tile) == "table" then
+				tx, ty = tile.x, tile.y
+			end
+			local dist
+			if type(tx) == "number" and type(ty) == "number" then
+				dist = math.abs(tx - px) + math.abs(ty - py) * 2
+			end
+			if not dist or dist <= state.mineRadius then
+				out[#out + 1] = { key = key, tile = tile, dist = dist or 9999 }
+			end
+		end
+	end
+	table.sort(out, function(a, b)
+		return a.dist < b.dist
+	end)
+	return out
+end
+ 
+local function stepMine()
+	if not state.autoMine then
+		setHold(false)
+		return
+	end
+	local w = getWorld()
+	if not (w and w.name ~= "") then
+		setHold(false)
+		return
+	end
+ 
+	local px, py = getPos()
+	if not px then
+		return
+	end
+ 
+	local tiles = matchingTiles(px, py)
+	if #tiles == 0 then
+		setHold(false)
+		return
+	end
+ 
+	if state.mineSingle then
+		breakTile(tiles[1].tile)
+		setAutoMine(false)
+		if MineToggle then
+			pcall(function()
+				MineToggle:Set(false)
+			end)
+		end
+		notify("Single block mined")
+		return
+	end
+ 
+	for _, entry in ipairs(tiles) do
+		if not state.autoMine or not state.running then
+			break
+		end
+		breakTile(entry.tile)
+		task.wait(state.mineDelay)
+	end
+end
+ 
+-- ==================================================================
+-- MOVEMENT / COLLECT
+-- ==================================================================
+ 
+local held = {}
+local function setKey(code, down)
+	if held[code] == down then
+		return
+	end
+	held[code] = down
+	pcall(function()
+		VIM:SendKeyEvent(down, code, false, game)
+	end)
+end
+ 
+local function releaseKeys()
+	for code, down in pairs(held) do
+		if down then
+			pcall(function()
+				VIM:SendKeyEvent(false, code, false, game)
+			end)
+		end
+		held[code] = nil
+	end
+end
+ 
+local function tapJump()
+	setKey(Enum.KeyCode.Space, true)
+	task.delay(0.1, function()
+		if state.running then
+			setKey(Enum.KeyCode.Space, false)
+		end
+	end)
+end
+ 
+local function tryMove(dir)
+	local before = {}
+	for _, c in ipairs(getCandidates()) do
+		before[c.i] = c.x
+	end
+	setKey(dir, true)
+	task.wait(0.35)
+	setKey(dir, false)
+	task.wait(0.08)
+	local changed = {}
+	for _, c in ipairs(getCandidates()) do
+		local b = before[c.i]
+		if b and math.abs(b - c.x) > 0.02 then
+			changed[#changed + 1] = c
+		end
+	end
+	return changed
+end
+ 
+local function calibrate()
+	if calibrating then
+		return false
+	end
+	local w = getWorld()
+	if not (w and w.name ~= "") then
+		return false
+	end
+	local list = getCandidates()
+	if #list == 0 then
+		return false
+	end
+	calibrating = true
+	local cx = readPos()
+	local dir = Enum.KeyCode.Right
+	local other = Enum.KeyCode.Left
+	if cx and cx > w.w - 3 then
+		dir, other = Enum.KeyCode.Left, Enum.KeyCode.Right
+	end
+	local changed = tryMove(dir)
+	if #changed == 0 then
+		tapJump()
+		task.wait(0.2)
+		changed = tryMove(dir)
+	end
+	if #changed == 0 then
+		changed = tryMove(other)
+	end
+	calibrating = false
+	if #changed == 0 then
+		return false
+	end
+	table.sort(changed, function(a, b)
+		return a.i > b.i
+	end)
+	posIndex = changed[1].i
+	return true
+end
+ 
+-- FIX: assign to the forward-declared local instead of creating a new one.
+getPos = function()
+	local x, y = readPos()
+	if x and y then
+		return x, y
+	end
+	local now = os.clock()
+	if now - posLastCalibration > 4 then
+		posLastCalibration = now
+		calibrate()
+		x, y = readPos()
+		if x and y then
+			return x, y
+		end
+	end
+end
+ 
+local collect = {
+	uid = nil,
+	lastX = nil,
+	lastProgress = 0,
+	stuck = 0,
+	lastJump = 0,
+	targetAt = 0,
+	skip = {},
+	backoff = {}, -- FIX: per-drop counter for un-armed step-back attempts
 }
-function WS.apply()
-    local m = math.max(0.1, CFG.WorkSpeed.Multiplier)
-    local B = CFG.WorkSpeed.Base
-    local E = WS.E
-    local fast = function(b) return math.max(0.01, b/m) end
-    E.WalkSpeed       = math.min(B.WalkSpeed * m, 1000)
-    E.HoldDuration    = fast(B.HoldDuration)
-    E.CooldownAfter   = fast(B.CooldownAfter)
-    E.CollectInterval = fast(B.CollectInterval)
-    E.PunchInterval   = fast(B.PunchInterval)
-    E.ScanInterval    = fast(B.ScanInterval)
-    E.SweepDelay      = fast(B.SweepDelay)
-    -- FIX: hanya ubah WalkSpeed kalau WorkSpeed aktif
-    if hum and CFG.WorkSpeed.Enabled then hum.WalkSpeed = E.WalkSpeed end
+ 
+local function activeDrops()
+	local w = getWorld()
+	if not (w and w.name ~= "") then
+		return {}
+	end
+	local ok, list = pcall(function()
+		return w.dropList()
+	end)
+	if not ok or type(list) ~= "table" then
+		return {}
+	end
+	return list
 end
-WS.apply()
-
-lp.CharacterAdded:Connect(function(c)
-    char = c
-    root = c:WaitForChild("HumanoidRootPart", 10)
-    hum  = c:FindFirstChildOfClass("Humanoid") or c:WaitForChild("Humanoid", 10)
-    WS.apply()
-end)
-
--- ══════════════════════════════════════════════════════════════
---  HELPERS
--- ══════════════════════════════════════════════════════════════
-local function partPos(i)
-    if i:IsA("Model") then return i:GetPivot().Position end
-    return i.Position
+ 
+local function pickDrop(px, py)
+	local list = activeDrops()
+	local now = os.clock()
+	local best, bestScore
+	-- FIX: pairs() instead of ipairs() so a uid-keyed dropList also works.
+	for _, d in pairs(list) do
+		-- FIX: skip malformed entries instead of erroring (which used to
+		-- silently disable Auto Collect).
+		if type(d) == "table" and type(d.x) == "number" and type(d.y) == "number" then
+			if not d.pending and not d.taking and not d.flown then
+				local key = d.uid
+				local skipAt = key ~= nil and collect.skip[key] or nil
+				if not skipAt or skipAt < now then
+					-- FIX: real straight-line distance from the player, so the
+					-- nearest drop is always picked first (the old score
+					-- doubled vertical distance and skipped closer drops
+					-- that were above or below the player).
+					local ddx, ddy = d.x - px, d.y - py
+					local score = math.sqrt(ddx * ddx + ddy * ddy)
+					if score <= state.range and (not best or score < bestScore) then
+						best, bestScore = d, score
+					end
+				end
+			end
+		end
+	end
+	-- FIX: drop expired skip entries so the table does not grow forever.
+	for k, t in pairs(collect.skip) do
+		if t < now then
+			collect.skip[k] = nil
+			collect.backoff[k] = nil
+		end
+	end
+	return best
 end
-local function distTo(i)
-    if not root then return math.huge end
-    return (partPos(i)-root.Position).Magnitude
+ 
+local function stopWalk()
+	setKey(Enum.KeyCode.Left, false)
+	setKey(Enum.KeyCode.Right, false)
 end
-local function matchPat(n,p)
-    for _,v in ipairs(p) do if string.find(n,v,1,true) then return true end end
-    return false
+ 
+local function skipTarget(target, now)
+	if target.uid ~= nil then
+		collect.skip[target.uid] = now + 10
+	end
+	collect.uid = nil
+	collect.stuck = 0
+	stopWalk()
 end
-local function getByTag(tag,pat,maxD)
-    local out,tagged={},CollectionService:GetTagged(tag)
-    local pool=(#tagged>0) and tagged or workspace:GetDescendants()
-    for _,v in ipairs(pool) do
-        if v:IsA("BasePart") or v:IsA("Model") then
-            -- FIX: jangan ikutkan karakter sendiri
-            if not (char and v:IsDescendantOf(char)) then
-                if #tagged>0 or matchPat(v.Name,pat) then
-                    if not maxD or distTo(v)<=maxD then out[#out+1]=v end
-                end
-            end
-        end
-    end
-    return out
+ 
+local function stepCollect()
+	if not state.autoCollect then
+		stopWalk()
+		collect.uid = nil
+		return
+	end
+	local w = getWorld()
+	if not (w and w.name ~= "") then
+		stopWalk()
+		return
+	end
+	if state.fly then
+		state.fly = false
+		w.ghost = false
+		if FlyToggle then
+			pcall(function()
+				FlyToggle:Set(false)
+			end)
+		end
+	end
+	local px, py = getPos()
+	if not px then
+		return
+	end
+	local target = pickDrop(px, py)
+	if not target then
+		stopWalk()
+		collect.uid = nil
+		return
+	end
+	if target.uid ~= collect.uid or collect.uid == nil then
+		collect.uid = target.uid
+		collect.lastX = px
+		collect.lastProgress = os.clock()
+		collect.stuck = 0
+		collect.targetAt = os.clock()
+	end
+	local dx, dy = target.x - px, target.y - py
+	if target.armed == false and target.id ~= 112 and math.abs(dx) < 1.0 then
+		-- FIX: count attempts; the old code reset collect.uid every time, so
+		-- the 8s timeout never fired and the player stepped back forever.
+		local key = target.uid
+		if key ~= nil then
+			collect.backoff[key] = (collect.backoff[key] or 0) + 1
+			if collect.backoff[key] > 6 then
+				skipTarget(target, os.clock())
+				return
+			end
+		end
+		stopWalk()
+		local away, toward
+		if dx >= 0 then
+			away, toward = Enum.KeyCode.Left, Enum.KeyCode.Right
+		else
+			away, toward = Enum.KeyCode.Right, Enum.KeyCode.Left
+		end
+		setKey(toward, false)
+		setKey(away, true)
+		task.wait(0.25)
+		setKey(away, false)
+		return
+	end
+	local moving = false
+	if dx > 0.08 then
+		setKey(Enum.KeyCode.Left, false)
+		setKey(Enum.KeyCode.Right, true)
+		moving = true
+	elseif dx < -0.08 then
+		setKey(Enum.KeyCode.Right, false)
+		setKey(Enum.KeyCode.Left, true)
+		moving = true
+	else
+		stopWalk()
+	end
+	local now = os.clock()
+	if dy < -1.05 and now - collect.lastJump > 0.5 then
+		collect.lastJump = now
+		tapJump()
+	end
+	if moving then
+		local last = collect.lastX or px
+		if math.abs(px - last) < 0.02 then
+			if now - collect.lastProgress > 0.5 then
+				collect.lastProgress = now
+				collect.stuck = collect.stuck + 1
+				if collect.stuck <= 4 then
+					tapJump()
+				else
+					skipTarget(target, now)
+					return
+				end
+			end
+		else
+			collect.lastX = px
+			collect.lastProgress = now
+			collect.stuck = 0
+		end
+	else
+		collect.lastX = px
+		collect.lastProgress = now
+	end
+	if now - collect.targetAt > 8 then
+		skipTarget(target, now)
+	end
 end
-local function sortDist(t)
-    table.sort(t,function(a,b) return distTo(a)<distTo(b) end)
+ 
+-- ==================================================================
+-- TOGGLES
+-- ==================================================================
+ 
+-- FIX: assign to the forward-declared local.
+notify = function(content, title)
+	pcall(function()
+		WindUI:Notify({
+			Title = title or "Growblox",
+			Content = content,
+			Icon = "sprout",
+			Duration = 3,
+		})
+	end)
 end
-local function findRemote(n)
-    return ReplicatedStorage:FindFirstChild(n,true)
-        or workspace:FindFirstChild(n,true)
+ 
+local function setFly(on)
+	state.fly = on
+	local w = getWorld()
+	if w then
+		w.ghost = on
+	end
+	if on and state.autoCollect then
+		state.autoCollect = false
+		releaseKeys()
+		if AutoToggle then
+			pcall(function()
+				AutoToggle:Set(false)
+			end)
+		end
+	end
 end
-local BreakRE = findRemote(CFG.Break.BreakRemote)
-local PunchRE = findRemote(CFG.Punch.Remote)
-
--- support mouse + touch (HP)
-local function isPress(i)
-    return i.UserInputType==Enum.UserInputType.MouseButton1
-        or i.UserInputType==Enum.UserInputType.Touch
+ 
+local function setAutoCollect(on)
+	if on and state.fly then
+		state.fly = false
+		local w = getWorld()
+		if w then
+			w.ghost = false
+		end
+		if FlyToggle then
+			pcall(function()
+				FlyToggle:Set(false)
+			end)
+		end
+	end
+	state.autoCollect = on
+	collect.uid = nil
+	collect.skip = {}
+	collect.backoff = {}
+	if not on then
+		releaseKeys()
+	end
 end
-local function isMove(i)
-    return i.UserInputType==Enum.UserInputType.MouseMovement
-        or i.UserInputType==Enum.UserInputType.Touch
+ 
+-- FIX: assign to the forward-declared local.
+setAutoMine = function(on)
+	state.autoMine = on
+	if not on then
+		setHold(false)
+	end
 end
-
--- ══════════════════════════════════════════════════════════════
---  IN-GAME UI
--- ══════════════════════════════════════════════════════════════
-local UI = {}
-
-local function newInst(cls, props)
-    local i = Instance.new(cls)
-    for k,v in pairs(props) do i[k]=v end
-    return i
+ 
+local function setNoclip(on)
+	state.noclip = on
+	local f = getSolidAt()
+	if on then
+		if f then
+			if not solidOriginal then
+				solidOriginal = hookfunction(f, function()
+					return false
+				end)
+			else
+				hookfunction(f, function()
+					return false
+				end)
+			end
+			notify("Noclip enabled")
+		else
+			state.noclip = false
+			if NoclipToggle then
+				pcall(function()
+					NoclipToggle:Set(false)
+				end)
+			end
+			notify("Noclip is not available yet")
+		end
+	elseif f and solidOriginal then
+		hookfunction(f, solidOriginal)
+		notify("Noclip disabled")
+	end
 end
-
-local function guiParent()
-    -- PlayerGui paling aman muncul di Delta/Fluxus Android & emulator
-    local ok,pg = pcall(function() return lp:WaitForChild("PlayerGui", 5) end)
-    if ok and pg then return pg end
-    local ok2,h = pcall(function() return gethui and gethui() end)
-    if ok2 and h then return h end
-    return game:GetService("CoreGui")
+ 
+local function applySpeed()
+	local w = getWorld()
+	if not w then
+		return
+	end
+	if state.speed and not state.fly then
+		w.speedScale = state.speedMult
+		state.speedApplied = true
+	elseif state.speedApplied then
+		w.speedScale = 1
+		state.speedApplied = false
+	end
 end
-
-local function makeToggleRow(parent, label, desc, yPos, key, initial, onToggle)
-    local row = newInst("Frame",{
-        Name=key.."Row", Parent=parent,
-        BackgroundColor3=Color3.fromRGB(28,28,34),
-        BorderSizePixel=0, Size=UDim2.new(1,-16,0,42),
-        Position=UDim2.new(0,8,0,yPos),
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,6),Parent=row})
-
-    newInst("TextLabel",{
-        Parent=row, Text=label,
-        Font=Enum.Font.GothamBold, TextSize=12,
-        TextColor3=Color3.fromRGB(232,232,236),
-        BackgroundTransparency=1,
-        Size=UDim2.new(1,-60,0,22),
-        Position=UDim2.new(0,10,0,4),
-        TextXAlignment=Enum.TextXAlignment.Left,
-    })
-    newInst("TextLabel",{
-        Parent=row, Text=desc,
-        Font=Enum.Font.Gotham, TextSize=10,
-        TextColor3=Color3.fromRGB(90,90,106),
-        BackgroundTransparency=1,
-        Size=UDim2.new(1,-60,0,16),
-        Position=UDim2.new(0,10,0,24),
-        TextXAlignment=Enum.TextXAlignment.Left,
-    })
-
-    local togBg = newInst("Frame",{
-        Parent=row, Name="TogBg",
-        Size=UDim2.new(0,38,0,20),
-        Position=UDim2.new(1,-48,0.5,-10),
-        BackgroundColor3=Color3.fromRGB(50,50,60),
-        BorderSizePixel=0,
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,10),Parent=togBg})
-
-    local thumb = newInst("Frame",{
-        Parent=togBg, Name="Thumb",
-        Size=UDim2.new(0,14,0,14),
-        Position=UDim2.new(0,3,0.5,-7),
-        BackgroundColor3=Color3.fromRGB(150,150,160),
-        BorderSizePixel=0,
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,7),Parent=thumb})
-
-    local state = initial and true or false
-    local function refresh()
-        local on = state
-        TweenService:Create(togBg, TweenInfo.new(0.15), {
-            BackgroundColor3 = on and Color3.fromRGB(77,204,60) or Color3.fromRGB(50,50,60)
-        }):Play()
-        TweenService:Create(thumb, TweenInfo.new(0.15), {
-            Position = on and UDim2.new(0,21,0.5,-7) or UDim2.new(0,3,0.5,-7),
-            BackgroundColor3 = on and Color3.fromRGB(255,255,255) or Color3.fromRGB(150,150,160),
-        }):Play()
-        TweenService:Create(row, TweenInfo.new(0.15), {
-            BackgroundColor3 = on and Color3.fromRGB(26,51,23) or Color3.fromRGB(28,28,34)
-        }):Play()
-    end
-    refresh() -- FIX: sinkronkan tampilan dengan state awal
-
-    local btn = newInst("TextButton",{
-        Parent=row, Text="", BackgroundTransparency=1,
-        Size=UDim2.new(1,0,1,0), Position=UDim2.new(0,0,0,0),
-    })
-    btn.MouseButton1Click:Connect(function()
-        state = not state
-        refresh()
-        onToggle(state)
-    end)
-
-    UI[key.."Toggle"] = function(s)
-        state=s; refresh()
-    end
-    return row
+ 
+local function setSpeed(on)
+	state.speed = on
+	applySpeed()
 end
-
-local function makeSlider(parent, label, min, max, val, yPos, fmt, onChange)
-    local row = newInst("Frame",{
-        Parent=parent,
-        BackgroundColor3=Color3.fromRGB(28,28,34),
-        BorderSizePixel=0, Size=UDim2.new(1,-16,0,52),
-        Position=UDim2.new(0,8,0,yPos),
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,6),Parent=row})
-
-    local valLabel = newInst("TextLabel",{
-        Parent=row,
-        BackgroundColor3=Color3.fromRGB(26,51,23),
-        BorderSizePixel=0,
-        Size=UDim2.new(0,52,0,20),
-        Position=UDim2.new(1,-60,0,6),
-        Text=fmt(val),
-        Font=Enum.Font.GothamBold, TextSize=11,
-        TextColor3=Color3.fromRGB(127,255,107),
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,4),Parent=valLabel})
-
-    newInst("TextLabel",{
-        Parent=row, Text=label,
-        Font=Enum.Font.GothamBold, TextSize=11,
-        TextColor3=Color3.fromRGB(152,152,168),
-        BackgroundTransparency=1,
-        Size=UDim2.new(1,-70,0,18),
-        Position=UDim2.new(0,10,0,6),
-        TextXAlignment=Enum.TextXAlignment.Left,
-    })
-
-    local track = newInst("Frame",{
-        Parent=row, BackgroundColor3=Color3.fromRGB(50,50,62),
-        BorderSizePixel=0,
-        Size=UDim2.new(1,-20,0,4),
-        Position=UDim2.new(0,10,0,36),
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,2),Parent=track})
-
-    local fill = newInst("Frame",{
-        Parent=track, BackgroundColor3=Color3.fromRGB(77,204,60),
-        BorderSizePixel=0, Size=UDim2.new((val-min)/(max-min),0,1,0),
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,2),Parent=fill})
-
-    local thumb = newInst("Frame",{
-        Parent=track,
-        BackgroundColor3=Color3.fromRGB(127,255,107),
-        BorderSizePixel=0, Size=UDim2.new(0,14,0,14),
-        AnchorPoint=Vector2.new(0.5,0.5), -- FIX: thumb di tengah posisi
-        Position=UDim2.new((val-min)/(max-min),0,0.5,0),
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,7),Parent=thumb})
-
-    local dragging = false
-    local dragBtn = newInst("TextButton",{
-        Parent=track, Text="", BackgroundTransparency=1,
-        Size=UDim2.new(1,14,0,24), Position=UDim2.new(0,-7,0.5,-12),
-    })
-
-    local function update(posX)
-        local rel = math.clamp((posX - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-        local newVal = math.floor((min + (max-min)*rel) * 100 + 0.5) / 100
-        local pct = (newVal-min)/(max-min)
-        fill.Size = UDim2.new(pct,0,1,0)
-        thumb.Position = UDim2.new(pct,0,0.5,0)
-        valLabel.Text = fmt(newVal)
-        onChange(newVal)
-    end
-
-    dragBtn.InputBegan:Connect(function(i)
-        if isPress(i) then
-            dragging=true
-            update(i.Position.X)
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(i)
-        if isPress(i) then dragging=false end
-    end)
-    UserInputService.InputChanged:Connect(function(i)
-        if dragging and isMove(i) then update(i.Position.X) end
-    end)
-    return row
+ 
+local function cleanup()
+	state.running = false
+	state.autoCollect = false
+	state.autoMine = false
+	setHold(false)
+	releaseKeys()
+	local w = getWorld()
+	if w then
+		pcall(function()
+			w.ghost = false
+		end)
+		if state.speedApplied then
+			pcall(function()
+				w.speedScale = 1
+			end)
+		end
+	end
+	if solidAt and solidOriginal then
+		pcall(function()
+			hookfunction(solidAt, solidOriginal)
+		end)
+	end
 end
-
-local function buildUI()
-    local parent = guiParent()
-    local old = parent:FindFirstChild("olliEMenu")
-    if old then old:Destroy() end
-
-    local sg = newInst("ScreenGui",{
-        Name="olliEMenu", Parent=parent,
-        ResetOnSpawn=false, ZIndexBehavior=Enum.ZIndexBehavior.Sibling,
-        DisplayOrder=999, IgnoreGuiInset=true,
-    })
-
-    local cam = workspace.CurrentCamera
-    local winH = 420
-    if cam then winH = math.clamp(cam.ViewportSize.Y - 60, 200, 420) end
-    local win = newInst("Frame",{
-        Parent=sg, Name="Win",
-        Size=UDim2.new(0,280,0,winH),
-        Position=UDim2.new(0,20,0.5,-winH/2),
-        BackgroundColor3=Color3.fromRGB(13,13,15),
-        BorderSizePixel=0, ClipsDescendants=true,
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,10),Parent=win})
-    newInst("UIStroke",{
-        Parent=win, Color=Color3.fromRGB(58,58,70),
-        Thickness=1, ApplyStrokeMode=Enum.ApplyStrokeMode.Border,
-    })
-
-    local title = newInst("Frame",{
-        Parent=win, Name="Title",
-        Size=UDim2.new(1,0,0,36),
-        BackgroundColor3=Color3.fromRGB(20,20,24),
-        BorderSizePixel=0,
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,10),Parent=title})
-    newInst("Frame",{
-        Parent=title, BackgroundColor3=Color3.fromRGB(20,20,24),
-        BorderSizePixel=0, Size=UDim2.new(1,0,0,10),
-        Position=UDim2.new(0,0,1,-10),
-    })
-    newInst("Frame",{
-        Parent=title,
-        BackgroundColor3=Color3.fromRGB(77,204,60),
-        BorderSizePixel=0, Size=UDim2.new(0,3,0,20),
-        Position=UDim2.new(0,10,0.5,-10),
-    })
-    newInst("TextLabel",{
-        Parent=title, Text="olliE  GrowBlox",
-        Font=Enum.Font.GothamBold, TextSize=13,
-        TextColor3=Color3.fromRGB(127,255,107),
-        BackgroundTransparency=1,
-        Size=UDim2.new(1,-80,1,0),
-        Position=UDim2.new(0,20,0,0),
-        TextXAlignment=Enum.TextXAlignment.Left,
-    })
-    newInst("TextLabel",{
-        Parent=title, Text="v2.2",
-        Font=Enum.Font.Gotham, TextSize=10,
-        TextColor3=Color3.fromRGB(90,90,106),
-        BackgroundTransparency=1,
-        Size=UDim2.new(0,30,1,0),
-        Position=UDim2.new(1,-70,0,0),
-        TextXAlignment=Enum.TextXAlignment.Right,
-    })
-    local minBtn = newInst("TextButton",{
-        Parent=title, Text="—",
-        Font=Enum.Font.GothamBold, TextSize=14,
-        TextColor3=Color3.fromRGB(90,90,106),
-        BackgroundTransparency=1,
-        Size=UDim2.new(0,28,0,28),
-        Position=UDim2.new(1,-32,0.5,-14),
-    })
-
-    -- drag window (mouse + touch)
-    local dragging,dragStart,startPos=false,nil,nil
-    title.InputBegan:Connect(function(i)
-        if isPress(i) then
-            dragging=true; dragStart=i.Position
-            startPos=win.Position
-        end
-    end)
-    UserInputService.InputEnded:Connect(function(i)
-        if isPress(i) then dragging=false end
-    end)
-    UserInputService.InputChanged:Connect(function(i)
-        if dragging and isMove(i) then
-            local d = i.Position - dragStart
-            win.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y
-            )
-        end
-    end)
-
-    local scroll = newInst("ScrollingFrame",{
-        Parent=win, Name="Scroll",
-        Position=UDim2.new(0,0,0,36),
-        Size=UDim2.new(1,0,1,-36),
-        BackgroundTransparency=1,
-        ScrollBarThickness=3,
-        ScrollBarImageColor3=Color3.fromRGB(77,204,60),
-        CanvasSize=UDim2.new(0,0,0,0),
-        BorderSizePixel=0,
-    })
-
-    local y = 8
-    local function section(txt)
-        local lbl = newInst("TextLabel",{
-            Parent=scroll, Text=txt,
-            Font=Enum.Font.GothamBold, TextSize=9,
-            TextColor3=Color3.fromRGB(90,90,106),
-            BackgroundTransparency=1,
-            Size=UDim2.new(1,-16,0,16),
-            Position=UDim2.new(0,8,0,y),
-            TextXAlignment=Enum.TextXAlignment.Left,
-        })
-        newInst("Frame",{
-            Parent=lbl, BackgroundColor3=Color3.fromRGB(42,42,52),
-            BorderSizePixel=0, Size=UDim2.new(1,0,0,1),
-            Position=UDim2.new(0,0,1,-1),
-        })
-        y = y + 22
-    end
-
-    local function addToggle(label, desc, key, cfgKey)
-        makeToggleRow(scroll, label, desc, y, key, CFG[cfgKey].Enabled, function(s)
-            CFG[cfgKey].Enabled = s
-            if cfgKey=="WorkSpeed" then
-                if s then
-                    WS.apply()
-                elseif hum then
-                    hum.WalkSpeed = CFG.WorkSpeed.Base.WalkSpeed
-                end
-            end
-        end)
-        y = y + 48
-    end
-
-    local function addSlider(label, mn, mx, val, fmt, onChange)
-        makeSlider(scroll, label, mn, mx, val, y, fmt, onChange)
-        y = y + 58
-    end
-
-    section("AUTO FARM")
-    addToggle("Auto Collect","item sweep + pathfinding","collect","Collect")
-    addToggle("Auto Break","hold-to-break blocks in radius","break","Break")
-    addToggle("Auto Clear World","breaks semua block di world","clear","Clear")
-
-    section("COMBAT")
-    addToggle("Long Punch","extended reach remote fire","punch","Punch")
-
-    section("UTILITY")
-    addToggle("GrowScan","floating item scanner","scan","Scan")
-    addToggle("Anti-AFK","anti kick idle","afk","AntiAFK")
-
-    section("WORKSPEED")
-    addToggle("WorkSpeed aktif","multiply semua interval + walkspeed","wspeed","WorkSpeed")
-
-    addSlider("Multiplier", 0.5, 10, CFG.WorkSpeed.Multiplier,
-        function(v) return string.format("%.1f×",v) end,
-        function(v)
-            CFG.WorkSpeed.Multiplier=v
-            WS.apply()
-        end
-    )
-    addSlider("Break hold (s)", 0, 1.5, CFG.Break.HoldDuration,
-        function(v) return string.format("%.2fs",v) end,
-        function(v)
-            CFG.Break.HoldDuration=v
-            CFG.WorkSpeed.Base.HoldDuration=v -- FIX: slider ini sebelumnya tidak berpengaruh
-            WS.apply()
-        end
-    )
-    addSlider("Break radius", 5, 80, CFG.Break.Radius,
-        function(v) return math.floor(v).."st" end,
-        function(v) CFG.Break.Radius=math.floor(v) end
-    )
-    addSlider("Punch range", 10, 120, CFG.Punch.Range,
-        function(v) return math.floor(v).."st" end,
-        function(v) CFG.Punch.Range=math.floor(v) end
-    )
-    addSlider("Collect radius", 10, 120, CFG.Collect.Radius,
-        function(v) return math.floor(v).."st" end,
-        function(v) CFG.Collect.Radius=math.floor(v) end
-    )
-
-    y = y + 8
-    scroll.CanvasSize = UDim2.new(0,0,0,y)
-
-    local minimized = false
-    minBtn.MouseButton1Click:Connect(function()
-        minimized = not minimized
-        TweenService:Create(win, TweenInfo.new(0.2), {
-            Size = minimized and UDim2.new(0,280,0,36) or UDim2.new(0,280,0,winH)
-        }):Play()
-        minBtn.Text = minimized and "+" or "—"
-    end)
-
-    local dot = newInst("Frame",{
-        Parent=title,
-        Size=UDim2.new(0,7,0,7),
-        Position=UDim2.new(1,-52,0.5,-3.5),
-        BackgroundColor3=Color3.fromRGB(90,90,106),
-        BorderSizePixel=0,
-    })
-    newInst("UICorner",{CornerRadius=UDim.new(0,4),Parent=dot})
-
-    RunService.Heartbeat:Connect(function()
-        local any = CFG.Collect.Enabled or CFG.Break.Enabled
-            or CFG.Punch.Enabled or CFG.Scan.Enabled or CFG.Clear.Enabled
-        dot.BackgroundColor3 = any
-            and Color3.fromRGB(77,204,60)
-            or Color3.fromRGB(90,90,106)
-    end)
-
-    print("[olliE] UI loaded")
-end
-
-print("[olliE] building UI...")
-local okUI, errUI = xpcall(buildUI, debug.traceback)
-if not okUI then
-    warn("[olliE] UI error: "..tostring(errUI))
-    pcall(function()
-        game:GetService("StarterGui"):SetCore("SendNotification",{
-            Title="olliE UI error", Text=tostring(errUI):sub(1,200), Duration=15,
-        })
-    end)
-end
-
--- ══════════════════════════════════════════════════════════════
---  BACKEND
--- ══════════════════════════════════════════════════════════════
-local function fireBreak(block)
-    if not BreakRE then BreakRE=findRemote(CFG.Break.BreakRemote) end
-    if BreakRE and BreakRE:IsA("RemoteEvent") then
-        BreakRE:FireServer(block, partPos(block))
-    end
-end
-
--- FIX: MoveToFinished:Wait() tidak punya timeout -> bisa hang selamanya.
-local function moveToWait(pos, timeout)
-    local done = false
-    local c = hum.MoveToFinished:Connect(function() done = true end)
-    hum:MoveTo(pos)
-    local t0 = tick()
-    while not done and tick()-t0 < timeout do task.wait(0.05) end
-    c:Disconnect()
-    return done
-end
-
-local PathMod={}; PathMod._active=false
-function PathMod:walkTo(target, depth)
-    depth = depth or 0
-    if depth > 3 then self._active=false; return end
-    local goal=partPos(target)
-    self._active=true
-    local path=PathfindingService:CreatePath({AgentRadius=2,AgentHeight=5,AgentCanJump=true,WaypointSpacing=4})
-    local ok=pcall(function() path:ComputeAsync(root.Position,goal) end)
-    if not ok or path.Status~=Enum.PathStatus.Success then
-        moveToWait(goal, 5)
-        self._active=false
-        return
-    end
-    local wps=path:GetWaypoints()
-    local lastPos=root.Position
-    local lastChange=tick()
-    local i=2
-    while i<=#wps and self._active do
-        local wp=wps[i]
-        if wp.Action==Enum.PathWaypointAction.Jump then hum.Jump=true end
-        local reached=false
-        local c=hum.MoveToFinished:Connect(function() reached=true end)
-        hum:MoveTo(wp.Position)
-        local t0=tick()
-        while not reached and tick()-t0<2 and self._active do
-            task.wait(0.1)
-            if (root.Position-lastPos).Magnitude>=CFG.Path.StuckThreshold then
-                lastPos=root.Position; lastChange=tick()
-            end
-            if tick()-lastChange>CFG.Path.RetryDelay then
-                c:Disconnect()
-                task.wait(0.1)
-                return self:walkTo(target, depth+1) -- retry
-            end
-        end
-        c:Disconnect()
-        i=i+CFG.Path.WaypointSkip
-    end
-    self._active=false
-end
-function PathMod:stop() self._active=false; hum:MoveTo(root.Position) end
-
--- collect
+ 
+-- ==================================================================
+-- UI
+-- ==================================================================
+ 
+local Window = WindUI:CreateWindow({
+	Title = "Growblox",
+	Author = "celineasher/growblox",
+	Icon = "sprout",
+	Folder = "Growblox",
+	ToggleKey = Enum.KeyCode.RightShift,
+	Theme = "Dark",
+	Transparent = true,
+	Resizable = true,
+	Size = UDim2.fromOffset(560, 460),
+})
+ 
+local MainTab = Window:Tab({ Title = "Main", Icon = "gamepad-2" })
+local FarmSection = MainTab:Section({ Title = "Auto Farm" })
+ 
+AutoToggle = FarmSection:Toggle({
+	Title = "Auto Collect",
+	Desc = "Walk to nearby drops and pick them up",
+	Value = false,
+	Callback = function(value)
+		setAutoCollect(value)
+		notify(value and "Auto collect enabled" or "Auto collect disabled")
+	end,
+})
+ 
+FarmSection:Space()
+FarmSection:Slider({
+	Title = "Collect Range",
+	Desc = "Maximum distance in tiles",
+	Step = 5,
+	Value = { Min = 10, Max = 200, Default = 80 },
+	Callback = function(value)
+		state.range = value
+	end,
+})
+ 
+local MineSection = MainTab:Section({ Title = "Auto Mine" })
+ 
+MineToggle = MineSection:Toggle({
+	Title = "Auto Mine",
+	Desc = "Hold-to-break matching blocks in range",
+	Value = false,
+	Callback = function(value)
+		setAutoMine(value)
+		notify(value and "Auto mine enabled" or "Auto mine disabled")
+	end,
+})
+ 
+MineSection:Space()
+MineSection:Input({
+	Title = "Block Filter",
+	Desc = "Only mine blocks whose name contains this (blank = any)",
+	Value = "",
+	Placeholder = "e.g. Stone",
+	Callback = function(value)
+		state.mineFilter = value or ""
+	end,
+})
+ 
+MineSection:Space()
+MineSection:Toggle({
+	Title = "Single Block Mode",
+	Desc = "Mine one block then stop (off = mine all in range)",
+	Value = false,
+	Callback = function(value)
+		state.mineSingle = value
+	end,
+})
+ 
+MineSection:Space()
+MineSection:Slider({
+	Title = "Mine Radius",
+	Desc = "Maximum distance in tiles",
+	Step = 5,
+	Value = { Min = 5, Max = 120, Default = 40 },
+	Callback = function(value)
+		state.mineRadius = value
+	end,
+})
+ 
+MineSection:Space()
+MineSection:Slider({
+	Title = "Hold Time",
+	Desc = "Max seconds to hold per block before moving on",
+	Step = 0.1,
+	Value = { Min = 0.3, Max = 5, Default = 1.5 },
+	Callback = function(value)
+		state.mineHold = value
+	end,
+})
+ 
+MineSection:Space()
+MineSection:Slider({
+	Title = "Block Delay",
+	Desc = "Pause between blocks in multi mode",
+	Step = 0.05,
+	Value = { Min = 0, Max = 1, Default = 0.15 },
+	Callback = function(value)
+		state.mineDelay = value
+	end,
+})
+ 
+local MoveSection = MainTab:Section({ Title = "Movement" })
+ 
+FlyToggle = MoveSection:Toggle({
+	Title = "Fly",
+	Desc = "Ghost flight with arrow keys, Space and Down",
+	Value = false,
+	Callback = function(value)
+		setFly(value)
+		notify(value and "Fly enabled" or "Fly disabled")
+	end,
+})
+ 
+MoveSection:Space()
+NoclipToggle = MoveSection:Toggle({
+	Title = "Noclip",
+	Desc = "Walk through walls",
+	Value = false,
+	Callback = function(value)
+		setNoclip(value)
+	end,
+})
+ 
+MoveSection:Space()
+SpeedToggle = MoveSection:Toggle({
+	Title = "Speed Boost",
+	Desc = "Multiplies walking speed",
+	Value = false,
+	Callback = function(value)
+		setSpeed(value)
+		notify(value and "Speed enabled" or "Speed disabled")
+	end,
+})
+ 
+MoveSection:Space()
+MoveSection:Slider({
+	Title = "Speed Multiplier",
+	Desc = "Values above 1.8 may trigger anti-cheat",
+	Step = 0.1,
+	Value = { Min = 1, Max = 3, Default = 1.8 },
+	Callback = function(value)
+		state.speedMult = value
+		applySpeed()
+	end,
+})
+ 
+local ActionSection = MainTab:Section({ Title = "Actions" })
+ 
+ActionSection:Button({
+	Title = "Reset Movement",
+	Desc = "Turn off fly, speed and noclip",
+	Callback = function()
+		setFly(false)
+		setSpeed(false)
+		setNoclip(false)
+		local w = getWorld()
+		if w then
+			w.ghost = false
+			w.speedScale = 1
+		end
+		state.speedApplied = false
+		releaseKeys()
+		pcall(function()
+			FlyToggle:Set(false)
+		end)
+		pcall(function()
+			SpeedToggle:Set(false)
+		end)
+		pcall(function()
+			NoclipToggle:Set(false)
+		end)
+		notify("Movement reset")
+	end,
+})
+ 
+ActionSection:Space()
+ActionSection:Button({
+	Title = "Mine Diagnostics",
+	Desc = "Dump what auto mine found (check console)",
+	Callback = function()
+		local w = getWorld()
+		print("[Growblox] world:", w ~= nil)
+		if w then
+			print("[Growblox] world.name:", w.name)
+			print("[Growblox] world.w, world.h:", w.w, w.h)
+		end
+		local container, where = worldTiles()
+		print("[Growblox] tile container:", container ~= nil, where)
+		if container then
+			local n = 0
+			for k, v in pairs(container) do
+				n = n + 1
+				if n <= 5 then
+					print("[Growblox] sample tile", k, "type=" .. type(v), "id=" .. tostring(tileId(v)), "name=" .. tostring(blockName(tileId(v))))
+				end
+			end
+			print("[Growblox] total tiles:", n)
+		end
+		local fn, err = detectMinePath()
+		print("[Growblox] mine function:", fn ~= nil, err)
+		notify("Diagnostics printed to console")
+	end,
+})
+ 
+ActionSection:Space()
+ActionSection:Button({
+	Title = "Unload Script",
+	Color = Color3.fromHex("#ff4830"),
+	Callback = function()
+		cleanup()
+		_G.GrowbloxLoaded = nil
+		pcall(function()
+			Window:Destroy()
+		end)
+	end,
+})
+ 
+local InfoTab = Window:Tab({ Title = "Info", Icon = "info" })
+local InfoSection = InfoTab:Section({ Title = "Status" })
+ 
+StatusParagraph = InfoSection:Paragraph({
+	Title = "Status",
+	Desc = "Loading...",
+})
+ 
+InfoSection:Space()
+InfoSection:Paragraph({
+	Title = "Auto Mine",
+	Desc = "Set a block name filter (blank mines anything), pick single or multi mode, then enable. Multi mines every matching block in radius, nearest first. Use Mine Diagnostics if it does nothing.",
+})
+ 
+InfoSection:Space()
+InfoSection:Paragraph({
+	Title = "Fly",
+	Desc = "Uses the game's ghost mode. Move with arrow keys, fly up with Space or Up, and down with Down. Auto Collect turns Fly off.",
+})
+ 
+InfoSection:Space()
+InfoSection:Paragraph({
+	Title = "Warnings",
+	Desc = "Speed above 1.8x and Noclip can trigger the game's anti-cheat. Use moderate values and enable them only when needed.",
+})
+ 
+-- ==================================================================
+-- LOOPS
+-- ==================================================================
+ 
 task.spawn(function()
-    while true do
-        if CFG.Collect.Enabled then
-            local ok,err = pcall(function()
-                local items=getByTag(CFG.Scan.ItemTag,CFG.Scan.ItemPatterns,nil)
-                local inR={}
-                for _,it in ipairs(items) do
-                    if distTo(it)<=CFG.Collect.Radius then inR[#inR+1]=it end
-                end
-                if #inR>0 then
-                    sortDist(inR)
-                    for _,it in ipairs(inR) do
-                        if not CFG.Collect.Enabled then break end
-                        if it.Parent then
-                            local re=it:FindFirstChildWhichIsA("RemoteEvent")
-                            if re then re:FireServer()
-                            else
-                                local prev=root.CFrame
-                                root.CFrame=CFrame.new(partPos(it))
-                                task.wait(0.05)
-                                root.CFrame=prev
-                            end
-                        end
-                        task.wait(0.03)
-                    end
-                else
-                    local best,bd=nil,math.huge
-                    for _,it in ipairs(items) do
-                        local d=distTo(it); if d<bd then best,bd=it,d end
-                    end
-                    if best and bd>CFG.Collect.Radius then PathMod:walkTo(best) end
-                end
-            end)
-            if not ok then warn("[olliE] collect: "..tostring(err)) end
-        end
-        task.wait(WS.E.CollectInterval)
-    end
+	while state.running do
+		task.wait(0.05)
+		if not state.running then
+			break
+		end
+		local ok, err = pcall(stepCollect)
+		if not ok then
+			-- FIX: report the error instead of silently turning off.
+			warn("[Growblox] auto collect error: " .. tostring(err))
+			setAutoCollect(false)
+			if AutoToggle then
+				pcall(function()
+					AutoToggle:Set(false)
+				end)
+			end
+			notify("Auto collect stopped: " .. tostring(err))
+		end
+	end
 end)
-
--- break
+ 
 task.spawn(function()
-    while true do
-        if CFG.Break.Enabled then
-            local ok,err = pcall(function()
-                local blocks=getByTag(CFG.Break.BlockTag,CFG.Break.BlockPatterns,CFG.Break.Radius)
-                if #blocks>0 then
-                    if CFG.Break.NearestFirst then sortDist(blocks) end
-                    for _,block in ipairs(blocks) do
-                        if not CFG.Break.Enabled then break end
-                        if block.Parent then
-                            local hd=WS.E.HoldDuration
-                            if hd<=0.01 then fireBreak(block)
-                            else
-                                local he=tick()+hd
-                                while tick()<he do
-                                    if not block.Parent then break end
-                                    fireBreak(block); task.wait(0.05)
-                                end
-                            end
-                            task.wait(WS.E.CooldownAfter)
-                        end
-                    end
-                end
-            end)
-            if not ok then warn("[olliE] break: "..tostring(err)) end
-        end
-        task.wait(0.1)
-    end
+	while state.running do
+		task.wait(0.1)
+		if not state.running then
+			break
+		end
+		if state.autoMine then
+			local ok, err = pcall(stepMine)
+			if not ok then
+				warn("[Growblox] auto mine error: " .. tostring(err))
+				setAutoMine(false)
+				if MineToggle then
+					pcall(function()
+						MineToggle:Set(false)
+					end)
+				end
+				notify("Auto mine stopped: internal error")
+			end
+		end
+	end
 end)
-
--- punch
-local pLast=0
+ 
 task.spawn(function()
-    while true do
-        if CFG.Punch.Enabled then
-            local now=tick()
-            if now-pLast>=WS.E.PunchInterval then
-                pLast=now -- FIX: selalu update, biar scan workspace tidak jalan tiap 0.05s (lag)
-                pcall(function()
-                    local best,bd=nil,math.huge
-                    for _,p in ipairs(Players:GetPlayers()) do
-                        if p~=lp and p.Character then
-                            local hrp=p.Character:FindFirstChild("HumanoidRootPart")
-                            if hrp then
-                                local d=(hrp.Position-root.Position).Magnitude
-                                if d<bd then best,bd=hrp,d end
-                            end
-                        end
-                    end
-                    for _,v in ipairs(workspace:GetDescendants()) do
-                        if v:IsA("Humanoid") and v.Health>0 then
-                            local nc=v.Parent
-                            if nc ~= char and not Players:GetPlayerFromCharacter(nc) then
-                                local hrp=nc:FindFirstChild("HumanoidRootPart")
-                                if hrp then
-                                    local d=(hrp.Position-root.Position).Magnitude
-                                    if d<bd then best,bd=hrp,d end
-                                end
-                            end
-                        end
-                    end
-                    if best and bd<=CFG.Punch.Range then
-                        if not PunchRE then PunchRE=findRemote(CFG.Punch.Remote) end
-                        if PunchRE and PunchRE:IsA("RemoteEvent") then
-                            PunchRE:FireServer(best.Parent,best.Position)
-                        end
-                    end
-                end)
-            end
-        end
-        task.wait(0.05)
-    end
+	while state.running do
+		task.wait(0.5)
+		if not state.running then
+			break
+		end
+		local w = getWorld()
+		local worldName = w and w.name ~= "" and w.name or "Menu"
+		local drops = 0
+		if w and w.name ~= "" then
+			local ok, list = pcall(function()
+				return w.dropList()
+			end)
+			if ok and type(list) == "table" then
+				for _ in pairs(list) do
+					drops = drops + 1
+				end
+			end
+		end
+		local px, py = readPos()
+		local posText = px and string.format("%.1f, %.1f", px, py) or "not calibrated"
+		local speedText = state.speed and string.format(" (%.1fx)", state.speedMult) or ""
+		local text = string.format(
+			"World: %s\nDrops: %d\nPosition: %s\n\nAuto Collect: %s\nAuto Mine: %s\nFly: %s\nNoclip: %s\nSpeed: %s%s",
+			worldName,
+			drops,
+			posText,
+			state.autoCollect and "ON" or "OFF",
+			state.autoMine and (state.mineSingle and "ON (single)" or "ON (multi)") or "OFF",
+			state.fly and "ON" or "OFF",
+			state.noclip and "ON" or "OFF",
+			state.speed and "ON" or "OFF",
+			speedText
+		)
+		pcall(function()
+			StatusParagraph:SetDesc(text)
+		end)
+		applySpeed()
+	end
 end)
-
--- scan
-task.spawn(function()
-    while true do
-        if CFG.Scan.Enabled and CFG.Scan.PrintToOutput then
-            pcall(function()
-                local items={}
-                local pool=getByTag(CFG.Scan.ItemTag,CFG.Scan.ItemPatterns,CFG.Scan.Radius)
-                for _,obj in ipairs(pool) do
-                    local id=obj.Name
-                    local av=obj:FindFirstChild("Amount") or obj:FindFirstChild("Count")
-                    local amt=(av and av:IsA("IntValue")) and av.Value or 1
-                    items[id]=(items[id] or 0)+amt
-                end
-                print("── GrowScan ──")
-                for id,c in pairs(items) do print(string.format("  %-20s x%d",id,c)) end
-            end)
-        end
-        task.wait(math.max(1, WS.E.ScanInterval))
-    end
-end)
-
--- anti-afk (FIX: pakai Idled + VirtualUser, bisa di-toggle dari UI)
-pcall(function()
-    local VirtualUser = game:GetService("VirtualUser")
-    lp.Idled:Connect(function()
-        if CFG.AntiAFK.Enabled then
-            VirtualUser:CaptureController()
-            VirtualUser:ClickButton2(Vector2.new())
-        end
-    end)
-end)
-
--- walkspeed sync
-task.spawn(function()
-    while true do
-        task.wait(2)
-        if CFG.WorkSpeed.Enabled and hum then
-            hum.WalkSpeed=WS.E.WalkSpeed
-        end
-    end
-end)
-
-print("[olliE] GrowBlox Suite v2.2 (fixed) loaded")
+ 
+_G.GrowbloxLoaded = {
+	Destroy = function()
+		cleanup()
+		pcall(function()
+			Window:Destroy()
+		end)
+	end,
+	state = state,
+	getWorld = getWorld,
+	getRender = getRender,
+	getCandidates = getCandidates,
+	getSolidAt = getSolidAt,
+	calibrate = calibrate,
+	readPos = readPos,
+	getPos = getPos,
+	worldTiles = worldTiles,
+	tileId = tileId,
+	blockName = blockName,
+	detectMinePath = detectMinePath,
+	setFly = setFly,
+	setNoclip = setNoclip,
+	setSpeed = setSpeed,
+	setAutoCollect = setAutoCollect,
+	setAutoMine = setAutoMine,
+	applySpeed = applySpeed,
+}
+ 
+notify("Loaded. Press RightShift to open.")
+ 
