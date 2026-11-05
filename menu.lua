@@ -5,6 +5,8 @@ end
 
 local player = game.Players.LocalPlayer
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Stats = game:GetService("Stats")
 
 local gui = Instance.new("ScreenGui")
 gui.Name = "MenuSaya"
@@ -39,7 +41,6 @@ judul.LayoutOrder = 0
 judul.Parent = frame
 judul.MouseButton1Click:Connect(function() gui:Destroy() end)
 
--- mengembalikan fungsi set(nilai) untuk menghidupkan/mematikan dari kode
 local function buatToggle(nama, urutan, saatBerubah)
 	local aktif = false
 	local btn = Instance.new("TextButton")
@@ -57,75 +58,75 @@ local function buatToggle(nama, urutan, saatBerubah)
 	end
 	refresh()
 
-	local function set(nilai)
-		if aktif == nilai then return end
-		aktif = nilai
+	btn.MouseButton1Click:Connect(function()
+		aktif = not aktif
 		refresh()
 		saatBerubah(aktif)
+	end)
+end
+
+-- Fitur 1: tampilan FPS dan ping
+local infoLabel = Instance.new("TextLabel")
+infoLabel.Size = UDim2.new(1, -16, 0, 24)
+infoLabel.LayoutOrder = 2
+infoLabel.BackgroundTransparency = 1
+infoLabel.Font = Enum.Font.Code
+infoLabel.TextSize = 14
+infoLabel.TextColor3 = Color3.fromRGB(200, 255, 200)
+infoLabel.Text = "FPS: -  |  Ping: - ms"
+infoLabel.Visible = false
+infoLabel.Parent = frame
+
+local koneksiFps
+local function ambilPing()
+	local ok, nilai = pcall(function()
+		return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+	end)
+	return ok and math.floor(nilai) or 0
+end
+
+buatToggle("FPS & Ping", 1, function(on)
+	infoLabel.Visible = on
+	if koneksiFps then
+		koneksiFps:Disconnect()
+		koneksiFps = nil
 	end
-
-	btn.MouseButton1Click:Connect(function()
-		set(not aktif)
-	end)
-
-	return set
-end
-
--- helper gerak
-local function ambilKarakter()
-	local char = player.Character
-	local hum = char and char:FindFirstChildOfClass("Humanoid")
-	local root = char and char:FindFirstChild("HumanoidRootPart")
-	return hum, root
-end
-
-local function berhenti(namaBind)
-	pcall(function() RunService:UnbindFromRenderStep(namaBind) end)
-	local hum = ambilKarakter()
-	if hum then hum:Move(Vector3.zero) end
-end
-
-local PRIORITAS = Enum.RenderPriority.Input.Value + 1
-local BIND_BOLAK = "JalanBolakBalik"
-local BIND_MAJU = "JalanMaju"
-
-local setBolak, setMaju
-
--- Fitur 1: jalan bolak-balik
-setBolak = buatToggle("Jalan Bolak-balik", 1, function(on)
-	if on then setMaju(false) end
-	berhenti(BIND_BOLAK)
 	if not on then return end
 
-	local arah = 1 -- 1 = maju, -1 = mundur
-	local gantiAt = os.clock() + 2
-
-	RunService:BindToRenderStep(BIND_BOLAK, PRIORITAS, function()
-		local hum, root = ambilKarakter()
-		if not (hum and root) then return end
-		if os.clock() >= gantiAt then
-			arah = -arah
-			gantiAt = os.clock() + 2
+	local frames = 0
+	local mulai = os.clock()
+	koneksiFps = RunService.RenderStepped:Connect(function()
+		frames += 1
+		local sekarang = os.clock()
+		if sekarang - mulai >= 0.5 then
+			local fps = math.floor(frames / (sekarang - mulai))
+			infoLabel.Text = ("FPS: %d  |  Ping: %d ms"):format(fps, ambilPing())
+			frames = 0
+			mulai = sekarang
 		end
-		hum:Move(root.CFrame.LookVector * arah, false)
 	end)
 end)
 
--- Fitur 2: jalan maju terus
-setMaju = buatToggle("Jalan Maju", 2, function(on)
-	if on then setBolak(false) end
-	berhenti(BIND_MAJU)
-	if not on then return end
+-- Fitur 2: sembunyikan atau tampilkan menu dengan RightShift
+local petunjuk = Instance.new("TextLabel")
+petunjuk.Size = UDim2.new(1, -16, 0, 20)
+petunjuk.LayoutOrder = 3
+petunjuk.BackgroundTransparency = 1
+petunjuk.Font = Enum.Font.Gotham
+petunjuk.TextSize = 12
+petunjuk.TextColor3 = Color3.fromRGB(150, 150, 160)
+petunjuk.Text = "RightShift: sembunyikan/tampilkan"
+petunjuk.Parent = frame
 
-	RunService:BindToRenderStep(BIND_MAJU, PRIORITAS, function()
-		local hum, root = ambilKarakter()
-		if not (hum and root) then return end
-		hum:Move(root.CFrame.LookVector, false)
-	end)
+local koneksiKey = UserInputService.InputBegan:Connect(function(input, diproses)
+	if diproses then return end
+	if input.KeyCode == Enum.KeyCode.RightShift then
+		frame.Visible = not frame.Visible
+	end
 end)
 
--- matikan semuanya saat menu ditutup
+-- bersihkan saat menu ditutup
 gui.Destroying:Connect(function()
-	berhenti(BIND_BOLAK)
-	berhenti(BIND_MAJU)
+	if koneksiFps then koneksiFps:Disconnect() end
+	koneksiKey:Disconnect()
 end)
