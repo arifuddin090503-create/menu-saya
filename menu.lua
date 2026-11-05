@@ -97,7 +97,3 @@ end)
 
 -- matikan jalan juga saat menu ditutup
 gui.Destroying:Connect(hentikanJalan)
-        gantiAt = os.clock() + 2
-    end
-    hum:Move(Vector3.new(0, 0, arah), true)
-end)
